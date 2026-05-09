@@ -159,13 +159,13 @@ def sgemm_smem(A, B, C, M, N, K):
         # inner loop for actual matmul
         for k in range(BK3):
             acc += A_shared[row_in_tile, k] * B_shared[k, col_in_tile] # row of A x col of b
-        
+        cuda.syncthreads()
     if global_row < M and global_col < N:
         C[global_row, global_col] = acc
     else:
         # if out of bounds, we don't write to C, but we still need to sync
         pass
-    cuda.syncthreads()
+    
 
 
 
@@ -203,7 +203,7 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     for i in range(TM4):
         acc[i] = float32(0.0)
 
-    A_shared = cuda.shared.array((BM4, BK4), float32)
+    A_shared = cuda.shared.array((BK4, BM4), float32)
     B_shared = cuda.shared.array((BK4, BN4), float32)
 
     a_row = cuda.threadIdx.x // BK4
@@ -213,9 +213,9 @@ def sgemm_1d_tile(A, B, C, M, N, K):
 
     for chunk in range((K + BK4 - 1) // BK4):
         if cuda.blockIdx.y * BM4 + a_row < M and chunk * BK4 + a_col < K:
-            A_shared[a_row, a_col] = A[cuda.blockIdx.y * BM4 + a_row, chunk * BK4 + a_col]
+            A_shared[a_col, a_row] = A[cuda.blockIdx.y * BM4 + a_row, chunk * BK4 + a_col]
         else:
-            A_shared[a_row, a_col] = float32(0.0)
+            A_shared[a_col, a_row] = float32(0.0)
         if chunk * BK4 + b_row < K and cuda.blockIdx.x * BN4 + b_col < N:
             B_shared[b_row, b_col] = B[chunk * BK4 + b_row, cuda.blockIdx.x * BN4 + b_col]
         else:
@@ -226,7 +226,7 @@ def sgemm_1d_tile(A, B, C, M, N, K):
         for k in range(BK4):
             b_tmp = B_shared[k, thread_col]
             for j in range(TM4):
-                acc[j] += A_shared[thread_row * TM4 + j, k] * b_tmp
+                acc[j] += A_shared[k, thread_row * TM4 + j] * b_tmp
         cuda.syncthreads()
 
     for j in range(TM4):
