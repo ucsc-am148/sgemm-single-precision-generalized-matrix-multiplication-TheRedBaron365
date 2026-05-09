@@ -171,17 +171,94 @@ def sgemm_smem(A, B, C, M, N, K):
 
 # ── K4: 1D register tiling (TODO) ───────────────────────────────────
 
+# @cuda.jit
+# def sgemm_1d_tile(A, B, C, M, N, K):
+
+#     tid = cuda.threadIdx.x
+
+#     # 512 threads arranged as:
+#     # 8 thread rows x 64 thread cols
+#     thread_row = tid // BN4
+#     thread_col = tid % BN4
+
+#     # each thread computes 8 rows in one column
+#     global_row = cuda.blockIdx.y * BM4 + thread_row * TM4
+#     global_col = cuda.blockIdx.x * BN4 + thread_col
+
+#     # shared memory
+#     As = cuda.shared.array((BM4, BK4), float32)
+#     Bs = cuda.shared.array((BK4, BN4), float32)
+
+#     # register accumulators
+#     acc = cuda.local.array(TM4, float32)
+
+#     for i in range(TM4):
+#         acc[i] = float32(0.0)
+
+#     # cooperative load indices
+#     a_row = tid // BK4
+#     a_col = tid % BK4
+
+#     b_row = tid // BN4
+#     b_col = tid % BN4
+
+#     # stream across K dimension
+#     for kb in range((K + BK4 - 1) // BK4):
+
+#         # load A tile
+#         gA_row = cuda.blockIdx.y * BM4 + a_row
+#         gA_col = kb * BK4 + a_col
+
+#         if gA_row < M and gA_col < K:
+#             As[a_row, a_col] = A[gA_row, gA_col]
+#         else:
+#             As[a_row, a_col] = 0.0
+
+#         # load B tile
+#         gB_row = kb * BK4 + b_row
+#         gB_col = cuda.blockIdx.x * BN4 + b_col
+
+#         if gB_row < K and gB_col < N:
+#             Bs[b_row, b_col] = B[gB_row, gB_col]
+#         else:
+#             Bs[b_row, b_col] = 0.0
+
+#         cuda.syncthreads()
+
+#         # compute
+#         for k in range(BK4):
+
+#             b_val = Bs[k, thread_col]
+
+#             row_base = thread_row * TM4
+
+#             for i in range(TM4):
+#                 acc[i] += As[row_base + i, k] * b_val
+
+#         cuda.syncthreads()
+
+#     # store results
+#     for i in range(TM4):
+
+#         r = global_row + i
+
+#         if r < M and global_col < N:
+#             C[r, global_col] = acc[i]
+
+
+# Will attempt a different approach. 
+# Minimize all loop overheads and  branching inside the inner loop, 
+# by fully unrolling the TM4=8 updates 
+# and doing the row-base + i indexing outside the inner loop.
+
 @cuda.jit
 def sgemm_1d_tile(A, B, C, M, N, K):
 
     tid = cuda.threadIdx.x
 
-    # 512 threads arranged as:
-    # 8 thread rows x 64 thread cols
     thread_row = tid // BN4
     thread_col = tid % BN4
 
-    # each thread computes 8 rows in one column
     global_row = cuda.blockIdx.y * BM4 + thread_row * TM4
     global_col = cuda.blockIdx.x * BN4 + thread_col
 
@@ -189,23 +266,28 @@ def sgemm_1d_tile(A, B, C, M, N, K):
     As = cuda.shared.array((BM4, BK4), float32)
     Bs = cuda.shared.array((BK4, BN4), float32)
 
-    # register accumulators
-    acc = cuda.local.array(TM4, float32)
+    # registers
+    acc0 = float32(0.0)
+    acc1 = float32(0.0)
+    acc2 = float32(0.0)
+    acc3 = float32(0.0)
+    acc4 = float32(0.0)
+    acc5 = float32(0.0)
+    acc6 = float32(0.0)
+    acc7 = float32(0.0)
 
-    for i in range(TM4):
-        acc[i] = float32(0.0)
-
-    # cooperative load indices
+    # cooperative load mapping
     a_row = tid // BK4
     a_col = tid % BK4
 
     b_row = tid // BN4
     b_col = tid % BN4
 
-    # stream across K dimension
+    row_base = thread_row * TM4
+
     for kb in range((K + BK4 - 1) // BK4):
 
-        # load A tile
+        # ---- load A ----
         gA_row = cuda.blockIdx.y * BM4 + a_row
         gA_col = kb * BK4 + a_col
 
@@ -214,7 +296,7 @@ def sgemm_1d_tile(A, B, C, M, N, K):
         else:
             As[a_row, a_col] = 0.0
 
-        # load B tile
+        # ---- load B ----
         gB_row = kb * BK4 + b_row
         gB_col = cuda.blockIdx.x * BN4 + b_col
 
@@ -225,25 +307,50 @@ def sgemm_1d_tile(A, B, C, M, N, K):
 
         cuda.syncthreads()
 
-        # compute
+        # ---- compute ----
         for k in range(BK4):
 
-            b_val = Bs[k, thread_col]
+            b = Bs[k, thread_col]
 
-            row_base = thread_row * TM4
-
-            for i in range(TM4):
-                acc[i] += As[row_base + i, k] * b_val
+            acc0 += As[row_base + 0, k] * b
+            acc1 += As[row_base + 1, k] * b
+            acc2 += As[row_base + 2, k] * b
+            acc3 += As[row_base + 3, k] * b
+            acc4 += As[row_base + 4, k] * b
+            acc5 += As[row_base + 5, k] * b
+            acc6 += As[row_base + 6, k] * b
+            acc7 += As[row_base + 7, k] * b
 
         cuda.syncthreads()
 
-    # store results
-    for i in range(TM4):
+    # ---- store ----
+    if global_col < N:
 
-        r = global_row + i
+        r0 = global_row + 0
+        r1 = global_row + 1
+        r2 = global_row + 2
+        r3 = global_row + 3
+        r4 = global_row + 4
+        r5 = global_row + 5
+        r6 = global_row + 6
+        r7 = global_row + 7
 
-        if r < M and global_col < N:
-            C[r, global_col] = acc[i]
+        if r0 < M:
+            C[r0, global_col] = acc0
+        if r1 < M:
+            C[r1, global_col] = acc1
+        if r2 < M:
+            C[r2, global_col] = acc2
+        if r3 < M:
+            C[r3, global_col] = acc3
+        if r4 < M:
+            C[r4, global_col] = acc4
+        if r5 < M:
+            C[r5, global_col] = acc5
+        if r6 < M:
+            C[r6, global_col] = acc6
+        if r7 < M:
+            C[r7, global_col] = acc7
 
 # ── K5: 2D register tiling (TODO) ───────────────────────────────────
 
