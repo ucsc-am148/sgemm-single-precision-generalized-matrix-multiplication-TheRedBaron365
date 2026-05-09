@@ -173,79 +173,77 @@ def sgemm_smem(A, B, C, M, N, K):
 
 @cuda.jit
 def sgemm_1d_tile(A, B, C, M, N, K):
-    """K4: extend K3 by giving each thread TM4 = 8 rows in a single column
-    of the BM4 x BN4 output tile.
 
-    Note: blockIdx.x now indexes COLUMNS of the output.
-    The run_k4 wrapper below already accounts for this, but you need to compute the global (row, col)
-    start of your block accordingly.
+    tid = cuda.threadIdx.x
 
-    Launch shape (run_k4 below uses this):
-        block = ((BM4 * BN4) // TM4,)           # 512 threads
-        grid  = (ceil(N / BN4), ceil(M / BM4))  # x = col, y = row
+    # 512 threads arranged as:
+    # 8 thread rows x 64 thread cols
+    thread_row = tid // BN4
+    thread_col = tid % BN4
 
-    Cooperative loads here are tidy: A's tile is BM4 x BK4 = 512 elements,
-    B's tile is BK4 x BN4 = 512 elements, and you have 512 threads so
-    exactly one element per thread per tile (so no inner-load loop)
+    # each thread computes 8 rows in one column
+    global_row = cuda.blockIdx.y * BM4 + thread_row * TM4
+    global_col = cuda.blockIdx.x * BN4 + thread_col
 
-    Use cuda.local.array(TM4, float32) for the per-thread accumulator array.
-    Initialize all entries to 0.0 before the K-loop.
-    """
-    
-@cuda.jit
-def sgemm_1d_tile(A, B, C, M, N, K):
-    thread_row = cuda.threadIdx.x // BN4
-    thread_col = cuda.threadIdx.x % BN4
-    # with the axis swap, blockIdx.x indexes columns of C
-    # , so we compute the global row and col accordingly
-    block_row = cuda.blockIdx.y * BM4
-    block_col = cuda.blockIdx.x * BN4
-    global_row = block_row + thread_row * TM4
-    global_col = block_col + thread_col
-    row_base = thread_row * TM4
+    # shared memory
+    As = cuda.shared.array((BM4, BK4), float32)
+    Bs = cuda.shared.array((BK4, BN4), float32)
 
-
+    # register accumulators
     acc = cuda.local.array(TM4, float32)
+
     for i in range(TM4):
-        acc[i] = float32(0.0) # initialize accumulators to 0.0
+        acc[i] = float32(0.0)
 
-    A_shared = cuda.shared.array((BK4, BM4), float32)
-    B_shared = cuda.shared.array((BK4, BN4), float32)
-    # with the cooperative loads, each thread loads one element of A and one element of B into shared memory
-    a_row = cuda.threadIdx.x // BK4
-    a_col = cuda.threadIdx.x % BK4
-    b_row = cuda.threadIdx.x // BN4
-    b_col = cuda.threadIdx.x % BN4
+    # cooperative load indices
+    a_row = tid // BK4
+    a_col = tid % BK4
 
-    a_row_global = block_row + a_row
-    b_col_global = block_col + b_col
-    # we need to loop over K in chunks of BK4, and for each chunk, we cooperatively load the tile of A and B into shared memory, then do the updates for our register tile
-    for chunk in range((K + BK4 - 1) // BK4):
-        chunk_offset = chunk * BK4
-        a_col_global = chunk_offset + a_col
-        b_row_global = chunk_offset + b_row
-        # for the cooperative load, we need to check bounds and load 0.0 if out of bounds
-        if a_row_global < M and a_col_global < K:
-            A_shared[a_col, a_row] = A[a_row_global, a_col_global]
+    b_row = tid // BN4
+    b_col = tid % BN4
+
+    # stream across K dimension
+    for kb in range((K + BK4 - 1) // BK4):
+
+        # load A tile
+        gA_row = cuda.blockIdx.y * BM4 + a_row
+        gA_col = kb * BK4 + a_col
+
+        if gA_row < M and gA_col < K:
+            As[a_row, a_col] = A[gA_row, gA_col]
         else:
-            A_shared[a_col, a_row] = float32(0.0)
-        if b_row_global < K and b_col_global < N:
-            B_shared[b_row, b_col] = B[b_row_global, b_col_global]
+            As[a_row, a_col] = 0.0
+
+        # load B tile
+        gB_row = kb * BK4 + b_row
+        gB_col = cuda.blockIdx.x * BN4 + b_col
+
+        if gB_row < K and gB_col < N:
+            Bs[b_row, b_col] = B[gB_row, gB_col]
         else:
-            B_shared[b_row, b_col] = float32(0.0)
+            Bs[b_row, b_col] = 0.0
 
         cuda.syncthreads()
-        # now we have the tile of A and B in shared memory, we can compute the updates for our register tile
+
+        # compute
         for k in range(BK4):
-            b_tmp = B_shared[k, thread_col]
-            for j in range(TM4):
-                acc[j] += A_shared[k, row_base + j] * b_tmp
-        cuda.syncthreads()
-        # after the K-loop, we write our register tile back to global memory
-    for j in range(TM4):
-        if global_row + j < M and global_col < N:
-            C[global_row + j, global_col] = acc[j]
 
+            b_val = Bs[k, thread_col]
+
+            row_base = thread_row * TM4
+
+            for i in range(TM4):
+                acc[i] += As[row_base + i, k] * b_val
+
+        cuda.syncthreads()
+
+    # store results
+    for i in range(TM4):
+
+        r = global_row + i
+
+        if r < M and global_col < N:
+            C[r, global_col] = acc[i]
 
 # ── K5: 2D register tiling (TODO) ───────────────────────────────────
 
